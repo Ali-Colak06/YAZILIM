@@ -1,8 +1,370 @@
 #!/usr/bin/env python3
 """
-Intel RealSense D435i Publisher Node
-Tüm kamera stream'lerini ROS topic'leri olarak yayınlar
-Intel RealSense D435i kamerasından alınan görüntüleri ROS sistem mimarimize yayınlar
+================================================================================
+              INTEL REALSENSE D435i DEPTH KAMERA ROS 2 PUBLISHER NODE
+================================================================================
+
+GENEL BAKIŞ:
+------------
+Bu modül, Intel RealSense D435i derinlik kamerasından tüm sensör verilerini
+(RGB, Depth, Infrared, IMU) alarak ROS 2 ekosisteminde topic'ler aracılığıyla
+yayınlayan bir publisher node implementasyonudur. 3D haritalama, SLAM, nesne
+tespiti, engel algılama ve robotik navigasyon uygulamaları için temel veri
+kaynağı sağlar.
+
+D435i KAMERA ÖZELLİKLERİ:
+-------------------------
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Sensör            │ Çözünürlük      │ FPS    │ FOV (HxV)    │ Açıklama      │
+├───────────────────┼─────────────────┼────────┼──────────────┼───────────────┤
+│ RGB Kamera        │ 1920x1080 max   │ 30     │ 69°x42°      │ Renkli görüntü│
+│ Depth Sensör      │ 1280x720 max    │ 90     │ 87°x58°      │ Stereo IR     │
+│ IR Kamera (Sol)   │ 1280x720 max    │ 90     │ 87°x58°      │ Kızılötesi    │
+│ IR Kamera (Sağ)   │ 1280x720 max    │ 90     │ 87°x58°      │ Kızılötesi    │
+│ IMU (Accel+Gyro)  │ -               │ 250/400│ -            │ 6-DOF hareket │
+└─────────────────────────────────────────────────────────────────────────────┘
+* Depth menzil: 0.1m - 10m (optimal: 0.3m - 3m)
+* Baseline (IR sensör arası mesafe): 50mm
+
+MİMARİ YAPI:
+------------
+┌─────────────────────┐     ┌──────────────────────────┐     ┌──────────────────┐
+│  Intel RealSense    │     │   RealSensePublisher     │     │   ROS 2 Topics   │
+│  D435i Kamera       │────▶│   Node                   │────▶│                  │
+│                     │     │   (pyrealsense2 +        │     │  /realsense/*    │
+│  ┌───────────────┐  │     │    cv_bridge)            │     │                  │
+│  │ RGB Sensor    │  │     │                          │     │  ├─ rgb/         │
+│  │ Depth Sensor  │  │     │  ┌────────────────────┐  │     │  ├─ depth/       │
+│  │ IR Left       │  │     │  │ rs.pipeline()      │  │     │  ├─ infra1/      │
+│  │ IR Right      │  │     │  │ rs.align()         │  │     │  ├─ infra2/      │
+│  │ IMU (6-DOF)   │  │     │  │ rs.config()        │  │     │  └─ imu/         │
+│  └───────────────┘  │     │  └────────────────────┘  │     │                  │
+└─────────────────────┘     └──────────────────────────┘     └──────────────────┘
+
+ÇALIŞMA PRENSİBİ:
+-----------------
+1. BAŞLATMA (Initialization):
+   - Node parametreleri okunur (çözünürlük, FPS, IMU aktif/pasif, vb.)
+   - ROS 2 publisher'ları oluşturulur (her stream için ayrı topic)
+   - pyrealsense2 pipeline ve config yapılandırılır
+   - Cihaz seri numarasıyla tanınır ve bağlanır
+   - Stream'ler (RGB, Depth, IR, IMU) aktifleştirilir
+   - Alignment objesi oluşturulur (depth-to-color hizalama)
+
+2. STREAM BAŞLATMA SIRASI:
+   ┌──────────────────────────────────────────────────────────────┐
+   │  rs.context() ──▶ query_devices() ──▶ enable_device(serial) │
+   │       │                                                      │
+   │       ▼                                                      │
+   │  rs.config() ──▶ enable_stream(color) ──┐                   │
+   │       │         enable_stream(depth) ───┤                   │
+   │       │         enable_stream(infrared)─┤                   │
+   │       │         enable_stream(accel) ───┤                   │
+   │       │         enable_stream(gyro) ────┘                   │
+   │       ▼                                                      │
+   │  rs.pipeline.start(config) ──▶ rs.align(color)              │
+   └──────────────────────────────────────────────────────────────┘
+
+3. FRAME DÖNGÜSÜ (Main Loop):
+   - Timer callback'i belirlenen FPS'e göre tetiklenir (varsayılan 30 Hz)
+   - pipeline.wait_for_frames() ile senkronize frame set alınır
+   - Her frame tipi ayrı ayrı işlenir ve ilgili topic'e publish edilir
+   - IMU verileri asenkron olarak okunur ve publish edilir
+
+4. DEPTH ALIGNMENT (Hizalama):
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │                        DEPTH-TO-COLOR ALIGNMENT                        │
+   │                                                                         │
+   │   Depth Frame          Aligned Depth           RGB Frame               │
+   │   (Depth FOV)          (RGB FOV)               (RGB FOV)               │
+   │  ┌───────────┐        ┌───────────┐          ┌───────────┐            │
+   │  │           │        │           │          │           │            │
+   │  │  ░░░░░░░  │  ───▶  │  ░░░░░░░  │    +     │  ▓▓▓▓▓▓▓  │            │
+   │  │  ░░░░░░░  │ align  │  ░░░░░░░  │          │  ▓▓▓▓▓▓▓  │            │
+   │  │           │        │           │          │           │            │
+   │  └───────────┘        └───────────┘          └───────────┘            │
+   │                              │                      │                  │
+   │                              └──────────┬───────────┘                  │
+   │                                         ▼                              │
+   │                                  RGBD Point Cloud                      │
+   │                                  (Her pikselde RGB + Z)                │
+   └─────────────────────────────────────────────────────────────────────────┘
+
+YAYIN AKIŞI (Publishing Pipeline):
+----------------------------------
+   [RealSense Frameset]
+          │
+          ├──▶ [Color Frame] ──────────────────▶ /realsense/rgb/image_raw
+          │         └──▶ [Intrinsics] ─────────▶ /realsense/rgb/camera_info
+          │
+          ├──▶ [Depth Frame] ──────────────────▶ /realsense/depth/image_rect
+          │         └──▶ [Intrinsics] ─────────▶ /realsense/depth/camera_info
+          │
+          ├──▶ [Aligned Depth] ────────────────▶ /realsense/depth/color_aligned
+          │         (RGB FOV'una hizalanmış)
+          │
+          ├──▶ [IR Frame 1] ───────────────────▶ /realsense/infra1/image_rect
+          │
+          ├──▶ [IR Frame 2] ───────────────────▶ /realsense/infra2/image_rect
+          │
+          ├──▶ [Accelerometer] ────────────────▶ /realsense/imu/accel
+          │
+          └──▶ [Gyroscope] ────────────────────▶ /realsense/imu/gyro
+
+YAYINLANAN TOPIC'LER:
+---------------------
+┌─────────────────────────────────┬─────────────────┬─────────────────────────┐
+│ Topic Adı                       │ Mesaj Tipi      │ Açıklama                │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/rgb/image_raw        │ sensor_msgs/    │ Renkli görüntü (BGR8)   │
+│                                 │ Image           │ 848x480 @ 30 FPS        │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/rgb/camera_info      │ sensor_msgs/    │ RGB kamera intrinsics   │
+│                                 │ CameraInfo      │ K, D, R, P matrisleri   │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/depth/image_rect     │ sensor_msgs/    │ Derinlik haritası       │
+│                                 │ Image           │ 16-bit (mm), 16UC1      │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/depth/camera_info    │ sensor_msgs/    │ Depth kamera intrinsics │
+│                                 │ CameraInfo      │ Stereo kalibrasyon      │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/depth/color_aligned  │ sensor_msgs/    │ RGB'ye hizalanmış depth │
+│                                 │ Image           │ Piksel-piksel eşleşme   │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/infra1/image_rect    │ sensor_msgs/    │ Sol IR kamera (mono8)   │
+│                                 │ Image           │ Stereo matching için    │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/infra2/image_rect    │ sensor_msgs/    │ Sağ IR kamera (mono8)   │
+│                                 │ Image           │ Stereo matching için    │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/imu/accel            │ sensor_msgs/    │ Lineer ivme (m/s²)      │
+│                                 │ Imu             │ x, y, z eksenleri       │
+├─────────────────────────────────┼─────────────────┼─────────────────────────┤
+│ /realsense/imu/gyro             │ sensor_msgs/    │ Açısal hız (rad/s)      │
+│                                 │ Imu             │ x, y, z eksenleri       │
+└─────────────────────────────────┴─────────────────┴─────────────────────────┘
+
+DEPTH VERİ FORMATI:
+-------------------
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Encoding: 16UC1 (16-bit unsigned, single channel)                         │
+│  Birim: Milimetre (mm)                                                     │
+│  Değer Aralığı: 0 - 65535 (0 = geçersiz/ölçülemedi)                        │
+│                                                                             │
+│  Örnek dönüşüm:                                                            │
+│    depth_value = 1500  →  Gerçek mesafe = 1.5 metre                        │
+│    depth_value = 0     →  Geçersiz ölçüm (çok yakın/uzak/yansıtıcı yüzey)  │
+│                                                                             │
+│  Python'da metre cinsine çevirme:                                          │
+│    depth_meters = depth_image.astype(np.float32) / 1000.0                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+IMU KOORDİNAT SİSTEMİ:
+----------------------
+            Z (yukarı)
+            │
+            │
+            │
+            └───────── Y (sağa)
+           ╱
+          ╱
+         X (ileri - kamera bakış yönü)
+
+Accelerometer (İvmeölçer):
+  - Durağan halde: accel.z ≈ -9.81 m/s² (yerçekimi)
+  - Birim: m/s²
+
+Gyroscope (Jiroskop):
+  - Birim: rad/s
+  - Pozitif yön: Sağ el kuralı (eksen etrafında saat yönünün tersi)
+
+KONFİGÜRASYON PARAMETRELERİ:
+----------------------------
+Parametre              Varsayılan   Açıklama
+─────────────────────────────────────────────────────────────────────────────
+rgb_width              848          RGB görüntü genişliği (piksel)
+rgb_height             480          RGB görüntü yüksekliği (piksel)
+depth_width            848          Depth görüntü genişliği (piksel)
+depth_height           480          Depth görüntü yüksekliği (piksel)
+fps                    30           Hedef frame rate (Hz)
+enable_imu             True         IMU verisi yayını aktif/pasif
+enable_infrared        True         IR kamera yayını aktif/pasif
+align_depth_to_color   True         Depth-RGB hizalama aktif/pasif
+
+DESTEKLENEN ÇÖZÜNÜRLÜKLER:
+--------------------------
+RGB (Color):
+  - 1920x1080 @ 30 FPS
+  - 1280x720 @ 30 FPS
+  - 848x480 @ 30/60 FPS (önerilen)
+  - 640x480 @ 30/60 FPS
+
+Depth/IR:
+  - 1280x720 @ 30 FPS
+  - 848x480 @ 30/60/90 FPS (önerilen)
+  - 640x480 @ 30/60/90 FPS
+  - 480x270 @ 30/60/90 FPS
+
+KULLANIM ÖRNEKLERİ:
+-------------------
+# Varsayılan parametrelerle başlatma:
+$ ros2 run <paket_adi> realsense_publisher
+
+# Yüksek çözünürlük modunda başlatma:
+$ ros2 run <paket_adi> realsense_publisher --ros-args \
+    -p rgb_width:=1280 \
+    -p rgb_height:=720 \
+    -p depth_width:=1280 \
+    -p depth_height:=720 \
+    -p fps:=30
+
+# Sadece RGB ve Depth (IMU/IR kapalı):
+$ ros2 run <paket_adi> realsense_publisher --ros-args \
+    -p enable_imu:=false \
+    -p enable_infrared:=false
+
+# Topic'leri görüntüleme:
+$ ros2 topic list | grep realsense
+$ ros2 topic hz /realsense/rgb/image_raw
+$ ros2 topic hz /realsense/depth/image_rect
+
+# Depth görüntüsünü RViz2'de görüntüleme:
+$ rviz2
+# Add → By topic → /realsense/depth/image_rect
+
+# Point cloud oluşturma (depth_image_proc ile):
+$ ros2 launch depth_image_proc point_cloud_xyz.launch.py \
+    depth_image_topic:=/realsense/depth/color_aligned \
+    camera_info_topic:=/realsense/rgb/camera_info
+
+BAĞIMLILIKLAR:
+--------------
+- rclpy             : ROS 2 Python client library
+- sensor_msgs       : Image, CameraInfo, Imu mesaj tipleri
+- cv_bridge         : OpenCV <-> ROS mesaj dönüşümü
+- pyrealsense2      : Intel RealSense SDK Python bindings
+- numpy             : Sayısal hesaplamalar
+
+PYREALSENSE2 KURULUMU:
+----------------------
+# pip ile kurulum:
+$ pip install pyrealsense2
+
+# veya kaynak koddan:
+$ git clone https://github.com/IntelRealSense/librealsense
+$ cd librealsense
+$ mkdir build && cd build
+$ cmake .. -DBUILD_PYTHON_BINDINGS=ON
+$ make -j4 && sudo make install
+
+SINIF HİYERARŞİSİ:
+------------------
+rclpy.node.Node
+       │
+       └── RealSensePublisher
+              │
+              ├── __init__()                 : Parametre ve publisher başlatma
+              ├── create_publishers()        : Topic publisher'ları oluşturma
+              ├── initialize_realsense()     : Pipeline ve stream yapılandırma
+              ├── publish_frames()           : Ana timer callback fonksiyonu
+              ├── publish_rgb_frame()        : BGR8 RGB görüntü yayını
+              ├── publish_depth_frame()      : 16UC1 depth görüntü yayını
+              ├── publish_aligned_depth_frame() : Hizalanmış depth yayını
+              ├── publish_infrared_frame()   : IR görüntü yayını (sol/sağ)
+              ├── publish_imu_accel()        : İvmeölçer verisi yayını
+              ├── publish_imu_gyro()         : Jiroskop verisi yayını
+              ├── create_camera_info()       : Kalibrasyon mesajı oluşturma
+              ├── print_stats()              : Frame istatistikleri
+              └── destroy_node()             : Temizlik ve pipeline durdurma
+
+FRAME SENKRONİZASYONU:
+----------------------
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  pipeline.wait_for_frames() metodu tüm aktif stream'lerden                 │
+│  senkronize frame set döndürür.                                            │
+│                                                                             │
+│  Frameset:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐           │
+│  │ Timestamp: T                                                 │           │
+│  │ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ │           │
+│  │ │ Color   │ │ Depth   │ │ IR Left │ │ IR Right│ │ IMU     │ │           │
+│  │ │ Frame   │ │ Frame   │ │ Frame   │ │ Frame   │ │ Data    │ │           │
+│  │ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘ │           │
+│  └─────────────────────────────────────────────────────────────┘           │
+│                                                                             │
+│  NOT: IMU farklı frekansta çalışır (250-400 Hz), interpolasyon gerekebilir │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PERFORMANS NOTLARI:
+-------------------
+- USB 3.0 bağlantı zorunludur (USB 2.0'da düşük FPS ve hata)
+- 848x480 @ 30 FPS tipik CPU kullanımı: ~10-15%
+- Alignment işlemi ek CPU yükü getirir (~5%)
+- Birden fazla stream aktifken USB bant genişliği kritik
+- Depth quality presets: High Accuracy / High Density / Medium Density
+
+D435 vs D435i FARKI:
+--------------------
+┌───────────────┬─────────────┬─────────────┐
+│ Özellik       │ D435        │ D435i       │
+├───────────────┼─────────────┼─────────────┤
+│ RGB Kamera    │ ✓           │ ✓           │
+│ Depth Sensör  │ ✓           │ ✓           │
+│ IR Kameralar  │ ✓           │ ✓           │
+│ IMU (6-DOF)   │ ✗           │ ✓           │
+│ VIO Desteği   │ ✗           │ ✓           │
+└───────────────┴─────────────┴─────────────┘
+* Bu kod D435'te de çalışır, sadece IMU özellikleri devre dışı kalır
+
+HATA AYIKLAMA:
+--------------
+- "No RealSense device found": 
+  → USB bağlantısını kontrol edin
+  → rs-enumerate-devices komutu ile cihazı görün
+  → udev rules kurulumu: /etc/udev/rules.d/99-realsense-libusb.rules
+
+- Düşük FPS:
+  → USB 3.0 port kullandığınızdan emin olun
+  → Çözünürlüğü düşürün
+  → Infrared stream'leri kapatın
+
+- Depth görüntüsünde boşluklar:
+  → Yansıtıcı yüzeyler veya güneş ışığı etkisi
+  → Depth filtreleri uygulayın (temporal, spatial, hole-filling)
+
+- IMU verisi gelmiyor:
+  → D435 modelinde IMU yoktur (D435i gerekli)
+  → enable_imu parametresini kontrol edin
+
+REALSENSE-ROS KARŞILAŞTIRMASI:
+------------------------------
+Bu custom node vs. Intel'in resmi realsense-ros paketi:
+
+Custom Node (Bu kod):
+  ✓ Hafif ve minimal bağımlılık
+  ✓ Kolay özelleştirme
+  ✓ Öğrenme amaçlı ideal
+  ✗ Tüm RealSense özellikleri yok
+
+realsense-ros (Intel resmi):
+  ✓ Tüm özellikler ve filtreler
+  ✓ Dinamik rekonfigürasyon
+  ✓ Launch dosyaları hazır
+  ✗ Daha karmaşık bağımlılık ağacı
+
+İLGİLİ ROS 2 PAKETLERİ:
+-----------------------
+- depth_image_proc  : Depth görüntü işleme, point cloud oluşturma
+- image_pipeline    : Görüntü işleme araçları
+- rtabmap_ros       : RGB-D SLAM
+- octomap           : 3D occupancy mapping
+- pointcloud_to_laserscan : 3D→2D dönüşüm (navigasyon için)
+
+YAZAR: [Proje Sahibi]
+TARİH: 2024
+LİSANS: [Lisans Bilgisi]
+VERSİYON: 1.0.0
+================================================================================
 """
 
 import rclpy
