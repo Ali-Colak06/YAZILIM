@@ -18,7 +18,7 @@ class QROkuyucuNode(Node):
             Image,
             '/realsense/rgb/image_raw',  
             self.kamera_callback,       
-            10                           # Kuyruk boyutu
+            10    # Kuyruk boyutu
         )
         
         self.qr_publisher = self.create_publisher(String, '/astrobiology/qr_result', 10)
@@ -66,7 +66,6 @@ class QROkuyucuNode(Node):
                     if qr_metni: # Boş değilse
                         self.get_logger().info(f"QR TESPİT EDİLDİ: {qr_metni}")
                         
-                        # Veriyi ROS ağına bağırıyoruz (Arayüz veya Astrobiyoloji node'u duysun diye)
                         mesaj = String()
                         mesaj.data = qr_metni
                         self.qr_publisher.publish(mesaj)
