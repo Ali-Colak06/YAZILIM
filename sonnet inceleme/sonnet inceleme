@@ -1,0 +1,38 @@
+Kodu inceliyorum önce, sonra listeleyip ekleyeceğim.Şimdi bu yeni kodu önceki kodla karşılaştırarak eklenecekleri belirleyelim:Yeni kodu tam olarak inceledim. Şimdi karşılaştırmalı liste:
+
+---
+
+## Bu Kodda Ne Var, Ne Eksik
+
+**Bu kodun öncekinden farklı yapısı:**
+- GNSS (NavSatFix) ile konum → dead reckoning değil, gerçek koordinat
+- ArUco marker tespiti (şu an boş bırakılmış, `error_x` hesaplanıyor ama kullanılmıyor)
+- Encoder geri beslemesi var (`read_serial_feedback` — speedR/L_meas okunuyor)
+- 3 ayrı seri port (okuma + 2x yazma, ön/arka motor ayrı)
+- 4 sabit hedef noktası sıralı geçiş
+- `tf_transformations` ile IMU yaw (AHRS yok)
+
+**Eklenecekler (önceki koddan öğrendiklerimiz):**
+
+| # | Eklenecek | Öncelik |
+|---|---|---|
+| 1 | MultiThreadedExecutor + CallbackGroup | 🔴 Kritik |
+| 2 | Watchdog timer | 🔴 Kritik |
+| 3 | Seri port reconnect (3 port için) | 🔴 Kritik |
+| 4 | AHRS füzyon (Mahony) — ham quaternion yerine | 🟠 Önemli |
+| 5 | Velocity smoothing (alpha low-pass) | 🟠 Önemli |
+| 6 | Heading deadband zaten var ama PI kontrolü yok (sadece P) | 🟠 Önemli |
+| 7 | dt eşiği (şu an yok) | 🟠 Önemli |
+| 8 | Logging throttle | 🟡 Normal |
+| 9 | ArUco `error_x` kullanılmıyor — ya tamamla ya temizle | 🟡 Normal |
+| 10 | `align_depth_callback` tamamen boş — depth hiç kullanılmıyor | 🟡 Normal |
+| 11 | GNSS warmup ortalaması alınıyor ama std sapma kontrolü yok | 🟡 Normal |
+| 12 | `vel_linear` hesaplanıyor ama hiç kullanılmıyor | 🔴 Bug |
+| 13 | `heading_error` angular speed sıfırlanınca `raw_angular` tanımsız kalabiliyor | 🔴 Bug |
+
+**Kasıtlı olarak eklemeyeceklerim:**
+- YOLO / derinlik filtresi — bu kod farklı görev, YOLO yok
+- Fotoğraf protokolü — bu kodda görev değil
+- Eğim güvenliği — IMU var ama bu kodda görev farklı, senin kararın
+
+Şimdi kodu yazıyorum:

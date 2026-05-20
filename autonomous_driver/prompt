@@ -1,0 +1,325 @@
+Sen bu projede kıdemli robotics/autonomous driving software engineer, ROS2 geliştiricisi, computer vision mühendisi ve safety-critical code reviewer rolündesin.
+
+İncelenecek dosya: autonomous_driver.py
+
+Amacımız:
+Bu dosyayı referans alarak daha sonra yeni, daha güvenilir ve daha modüler bir otonom sürüş kodu yazmak veya mevcut kodun eksiklerini gidermek istiyoruz. Bu yüzden autonomous_driver.py dosyasını yüzeysel değil, çok detaylı şekilde anlamamız gerekiyor.
+
+Çıktıyı kısa tutma. Chat mesajı olarak özet geçmek yerine raporu dosya/dosyalar halinde kaydet. autonomous_driver.py dosyasını değiştirme. Sadece docs/ klasörü altında Markdown raporları oluştur. docs/ klasörü yoksa oluştur.
+
+Önerilen çıktı dosyaları:
+- docs/autonomous_driver_analysis.md
+- docs/autonomous_driver_risks_and_gaps.md
+- docs/autonomous_driver_rewrite_plan.md
+
+Eğer rapor çok uzunsa bu dosyaları daha küçük parçalara bölebilirsin. Hiçbir bölümü “özet” seviyesinde bırakma.
+
+Analiz sırasında mutlaka şunları yap:
+
+1. Genel mimariyi açıkla
+- Bu dosyanın amacı ne?
+- Rover’da hangi problemi çözüyor?
+- Ana alt sistemler neler?
+- Kod yarışmada doğrudan kullanılabilir mi, yoksa refactor/yeniden yazım gerekir mi?
+
+2. Tüm alt sistemleri detaylı incele
+Aşağıdaki sistemlerin her biri için sorumluluk, input, output, ilgili class/fonksiyonlar, diğer modüllerle ilişkiler ve zayıf noktaları açıkla:
+- Motor control layer
+- UART BLDC control
+- Step motor control
+- Encoder/home position mantığı
+- ROS2 camera layer
+- ZMQ communication layer
+- YOLO detection/segmentation layer
+- ArUco landmark detection layer
+- Obstacle avoidance planner
+- PID heading alignment
+- Autonomous FSM
+- Watchdog
+- E-stop
+- Overlay/health publishing
+- Waypoint receiver
+- Main/runtime başlatma akışı
+
+3. Bağımlılıkları ve çalışma ortamını çıkar
+Tablo halinde açıkla:
+- Python standard library bağımlılıkları
+- Üçüncü parti paketler
+- ROS2 bağımlılıkları
+- Kamera topicleri
+- ZMQ portları
+- Serial portlar
+- YOLO model dosyaları
+- Donanım varsayımları
+
+Her biri için nerede kullanılıyor, eksikse ne olur, nasıl mock/test edilir belirt.
+
+4. Sabitleri ve ayar parametrelerini açıkla
+Kod içindeki önemli sabitleri incele:
+- Hızlar
+- ArUco ayarları
+- Kamera matrisi
+- PID katsayıları
+- Watchdog/mission/search timeout değerleri
+- Obstacle threshold değerleri
+- FSM/YOLO/ArUco/overlay frekansları
+- ZMQ portları
+
+Her sabit için ne işe yaradığını, davranışı nasıl etkilediğini, yanlış kalibre edilirse ne olacağını ve gerçek rover için nasıl ayarlanması gerektiğini açıkla.
+
+5. Veri modellerini açıkla
+Aşağıdaki yapıların alanlarını, nerede üretildiğini, nerede tüketildiğini ve yeni tasarımda değişip değişmemesi gerektiğini anlat:
+- DriveCmd
+- ArucoDetection
+- WaypointList
+- DetectionResult
+- SegmentationResult
+- Action enum
+- State enum
+
+6. Class ve fonksiyon walkthrough yap
+Dosyadaki tüm önemli class ve fonksiyonları tek tek incele. Her biri için:
+- Amacı
+- Input/output
+- İç mantığı
+- Hangi alt sistemin parçası olduğu
+- Hangi riskleri taşıdığı
+- Yeni tasarımda korunmalı mı, refactor edilmeli mi, baştan mı yazılmalı?
+
+Özellikle şu yapıları derin incele:
+- MotorBus
+- UARTMotorBus
+- CANMotorBus
+- TelemetrySubscriber
+- CameraHub
+- YoloWorker
+- ArucoWorker
+- PIDController
+- AvoidancePlanner
+- OverlayPublisher
+- WaypointReceiver
+- execute_estop
+- Watchdog
+- AutonomousFSM
+
+7. Algoritmaları detaylı açıkla
+Kodda kullanılan karar/algoritma mantıklarını açıkla:
+- YOLO detection/segmentation kullanımı
+- ArUco detection
+- solvePnP ile pose estimation
+- heading error hesabı
+- PID ile yön hizalama
+- obstacle avoidance kararı
+- depth/segmentation/bbox tabanlı sağ-sol kararları
+- waypoint yaklaşma mantığı
+- ArUco arama/tarama mantığı
+- mission timeout/search timeout
+- return home mantığı
+- E-stop home dönüşü
+
+Her algoritma için güçlü/zayıf yönleri, gerçek rover’da ne kadar yeterli olduğu ve nasıl iyileştirilebileceğini belirt.
+
+8. FSM’i çok detaylı açıkla
+AutonomousFSM içindeki tüm state’leri tek tek incele:
+- IDLE
+- SCAN
+- TURN_PREP
+- TURN
+- SETTLE_5MS
+- DRIVE
+- CHECK_OBSTACLE
+- NAVIGATE_INIT
+- SEARCH_LANDMARK
+- ALIGN_HEADING
+- APPROACH_WAYPOINT
+- WAYPOINT_REACHED
+- RETURN_HOME
+- MISSION_COMPLETE
+- E_STOP
+- WATCHDOG_TRIGGERED
+
+Her state için:
+- Ne amaçla var?
+- Nasıl giriliyor?
+- Hangi veri okunuyor?
+- Hangi motor komutu üretiliyor?
+- Hangi koşulda hangi state’e geçiyor?
+- Riskli durumlar neler?
+
+Ayrıca bir transition table oluştur:
+Current State | Condition | Action | Next State
+
+Ve Mermaid formatında FSM diagramı üret.
+
+9. Girdi/çıktı ve veri akışını çıkar
+Tüm sistemi uçtan uca açıkla:
+- Kamera görüntüsü nereden geliyor?
+- YOLO sonucu nerede üretiliyor?
+- ArUco sonucu nerede üretiliyor?
+- Waypoint komutu nereden geliyor?
+- Telemetri nereden geliyor?
+- Motor komutları nerede üretiliyor?
+- BLDC/step motorlara hangi formatta gidiyor?
+- Overlay/health/state bilgileri nerelere yayınlanıyor?
+
+Bunu hem tablo hem de Mermaid data flow diagram olarak ver.
+
+10. Threading/concurrency analizi yap
+Tüm threadleri ve shared state kullanımını çıkar:
+- TelemetrySubscriber
+- CameraHub ROS executor
+- YoloWorker
+- ArucoWorker
+- OverlayPublisher
+- WaypointReceiver
+- Watchdog
+- UART read threads
+- Main FSM loop
+
+Her biri için:
+- Ne yapıyor?
+- Hangi frekansta çalışıyor?
+- Hangi veriye erişiyor?
+- Lock kullanımı yeterli mi?
+- Race condition/deadlock ihtimali var mı?
+- Shutdown güvenli mi?
+
+11. Failure mode ve safety analizi yap
+Aşağıdaki durumlarda kodun ne yaptığını, bunun yeterli olup olmadığını ve nasıl iyileştirilmesi gerektiğini açıkla:
+- Kamera yok/geç geliyor/stale frame var
+- Depth yok
+- YOLO modeli yok veya inference yavaş
+- ArUco görünmüyor/yanlış ID görünüyor/kayboluyor
+- Kamera kalibrasyonu yanlış
+- Serial port açılmıyor
+- BLDC feedback bozuk
+- Step encoder yok
+- ZMQ mesajı bozuk
+- Abort geliyor
+- Watchdog yanlış tetikliyor veya tetiklemiyor
+- FSM state’te takılıyor
+- Obstacle avoidance yanlış karar veriyor
+- Step ve BLDC aynı anda çalışma riski
+- E-stop sırasında home dönüşü başarısız oluyor
+
+12. Bug, code smell ve tasarım zayıflıklarını listele
+Her problem için:
+- Nerede?
+- Sorun ne?
+- Neden riskli?
+- Nasıl düzeltilmeli?
+- Yeni sistemde nasıl tasarlanmalı?
+
+Özellikle şunlara dikkat et:
+- Tek dosyada çok fazla sorumluluk
+- Hard-coded topic/port/camera matrix
+- Magic number kullanımı
+- Sessizce pass edilen exceptionlar
+- Test edilebilirlik eksikliği
+- Eksik sensor fusion/localization
+- Basit obstacle avoidance
+- Return home’un gerçek localization olmaması
+- CANMotorBus’ın uygulanmamış olması
+- Thread lifecycle/shutdown problemleri
+- Safety-critical eksikler
+
+13. Korunacak/refactor edilecek/baştan yazılacak parçaları ayır
+Üç tablo oluştur:
+- Korunabilir parçalar
+- Refactor edilmesi gereken parçalar
+- Baştan yazılması gereken parçalar
+
+Her satırda nedenini ve önerilen aksiyonu yaz.
+
+14. Yeni otonom sürüş kodu için mimari öner
+Yeni sistem için önerilen klasör/modül yapısını çıkar:
+- config/
+- hardware/
+- perception/
+- localization/
+- navigation/
+- planning/
+- control/
+- safety/
+- communication/
+- diagnostics/
+- mission/
+- tests/
+
+Her modül için:
+- Sorumluluk
+- Input/output
+- Önerilen classlar
+- Bu dosyadan taşınacak parçalar
+- Test stratejisi
+
+15. Yeni kod için requirement dokümanı çıkar
+Aşağıdaki başlıklarda requirement yaz:
+- Functional requirements
+- Safety requirements
+- Performance requirements
+- Sensor requirements
+- Motor control requirements
+- Mission requirements
+- Testing requirements
+- Logging/diagnostics requirements
+- Configuration requirements
+
+16. Uygulama yol haritası çıkar
+Yeni sistemi yazmak için phase phase plan ver:
+- Modülerleştirme
+- Config sistemi
+- Mock motor bus
+- Camera/perception interface
+- ArUco navigation stabilizasyonu
+- Obstacle avoidance iyileştirmesi
+- Safety/watchdog/E-stop layer
+- Simulation/test harness
+- Real rover integration
+- Competition readiness checklist
+
+Her phase için yapılacaklar, dosya önerileri, testler ve başarı kriterleri yaz.
+
+17. Test planı oluştur
+Ayrıntılı test planı çıkar:
+- Unit tests
+- Integration tests
+- Hardware-in-the-loop tests
+- Fake obstacle tests
+- Fake ArUco tests
+- ZMQ message tests
+- Serial mock tests
+- Watchdog tests
+- E-stop tests
+- Mission timeout tests
+- Camera loss tests
+
+Her test için senaryo, beklenen sonuç ve otomasyon önerisi ver.
+
+18. Diyagram üret
+Mermaid formatında şu diyagramları ekle:
+- High-level architecture diagram
+- Data flow diagram
+- Thread/process diagram
+- FSM state diagram
+- Motor command flow
+- Safety/watchdog flow
+- Mission flow
+
+19. Final recommendation yaz
+En sonda net bir değerlendirme yap:
+- Bu kod yarışmaya ne kadar hazır?
+- En büyük 10 risk
+- En acil 10 düzeltme
+- Yeni kodda ilk başlanacak yer
+- Bu koddan korunması gereken fikirler
+- Bu koddan kaçınılması gereken tasarım hataları
+- Ekibin cevaplaması gereken açık sorular
+
+Önemli kurallar:
+- autonomous_driver.py dosyasını değiştirme.
+- Bilmediğin şeyi kesin bilgi gibi sunma.
+- Koddan çıkardığın bilgileri açıkça belirt.
+- Yarışma ve gerçek rover bağlamında pratik öneriler ver.
+- Raporları uzun ve detaylı yaz.
+- Sadece analiz değil, yeni kodu yazmaya hazırlayacak teknik döküman üret.
