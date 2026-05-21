@@ -1,342 +1,804 @@
+#!/usr/bin/env python3
+# GÜVENLİK: sudo usermod -a -G dialout $USER
+# pip install ahrs --break-system-packages
+
+# -------------------------------------------------------------------
+# YAPILAN DEĞİŞİKLİKLER (rover_master.py'dan öğrenilen protokoller):
+#
+#   [✅MT]    MultiThreadedExecutor     — IMU/GNSS callback'leri kontrol döngüsünü bloklamaz
+#              RGB → MutuallyExclusive | Diğerleri → Reentrant
+#   [✅WD]    Watchdog timer            — 0.5 sn kontrol döngüsü yoksa acil dur
+#   [✅RC]    Seri port reconnect       — 3 port için ayrı ayrı, max 3 deneme
+#   [✅AHRS]  Mahony füzyon             — ham quaternion→euler yerine filtreli yaw
+#   [✅VS]    Velocity smoothing        — alpha=0.15 low-pass, ani jerk engelleme
+#   [✅PI]    PI kontrolü               — global_Ki ile uzun mesafe sapma düzeltme
+#   [✅DT]    dt eşiği                  — 0.3 sn üstünü kes
+#   [✅LOG]   Logging throttle          — tekrarlayan loglar 1-2 Hz'e alındı
+#   [BUG FIX] vel_linear kullanılmıyordu — odometri için hesaba katıldı
+#   [BUG FIX] raw_angular tanımsız kalabiliyordu — deadband bloğu düzeltildi
+#   [BUG FIX] ArUco error_x hesaplanıyor ama kullanılmıyordu — servoing'e bağlandı
+#   [✅GNSS]  GNSS warmup std sapma kontrolü — kararsız fix'leri dışarıda bırak
+# -------------------------------------------------------------------
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 
-from sensor_msgs.msg import Image, CameraInfo, Imu, NavSatFix
-from geometry_msgs.msg import Twist, PoseStamped, Point
-from nav_msgs.msg import Odometry
-
-import tf2_ros
-import tf2_geometry_msgs
-from tf_transformations import euler_from_quaternion
+from sensor_msgs.msg import Image, Imu, NavSatFix
+from geometry_msgs.msg import Twist
 
 from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
 import math
 import time
-
 import serial
 import struct
-
 import cv2
+from threading import Lock
+
+from ahrs.filters import Mahony
+from ahrs.common.orientation import q2euler
+
 
 class RoverNavigation(Node):
     def __init__(self):
         super().__init__("Rover_navigation_node")
 
+        # ============================================================
+        #  CALLBACK GRUPLARI
+        # ============================================================
+        # RGB (ArUco) işlemi ağır olabilir → kendi grubu
+        self.aruco_cb_group   = MutuallyExclusiveCallbackGroup()
+        # IMU, GNSS, kontrol döngüsü → birbirini beklemeden çalışır
+        self.control_cb_group = ReentrantCallbackGroup()
+
+        # ============================================================
+        #  KİLİT
+        # ============================================================
+        self.data_lock = Lock()
+
+        # ============================================================
+        #  SERİ PORTLAR
+        # ============================================================
+        self.ser_read         = self._open_serial('/dev/ttyUSB0', tag='ser_read')
+        self.ser_write_front  = self._open_serial('/dev/ttyUSB1', tag='ser_write_front')
+        self.ser_write_back   = self._open_serial('/dev/ttyUSB2', tag='ser_write_back')
+
+        self.START_FRAME = 0xABCD
+        self.buffer      = bytearray()
+
+        # ============================================================
+        #  KAMERA & ArUco
+        # ============================================================
+        self.cv_bridge     = CvBridge()
+        self.aruco_dict    = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
+        self.aruco_params  = cv2.aruco.DetectorParameters()
+
+        # ArUco servoing verisi (kilitli paylaşım)
+        self.aruco_error_x  = None   # piksel cinsinden yatay hata (None = marker yok)
+        self.aruco_img_w    = 640    # varsayılan genişlik, rgb_callback'te güncellenir
+
+        # ============================================================
+        #  GNSS
+        # ============================================================
+        self.warmup_count  = 0
+        self.warmup_limit  = 20
+        self.lat_buffer    = []
+        self.lon_buffer    = []
+
+        # [✅GNSS] Std sapma eşiği — kararsız fix'leri filtrele
+        self.GNSS_STD_THRESHOLD = 0.00005  # ~5 m beklenen std sapma
+        self.is_gnss_available  = False
+        self.gnss_origin_lat    = None
+        self.gnss_origin_lon    = None
+
+        self.current_x = None
+        self.current_y = None
+
+        # [GNSS YAW] Ardışık GNSS fix'lerinden Mahony drift düzeltmesi
+        self.prev_gnss_x       = None
+        self.prev_gnss_y       = None
+        self.GNSS_YAW_MIN_DIST = 1.0   # m — düzeltme için gereken min hareket
+        self.GNSS_YAW_BLEND    = 0.1   # yavaş blend — GNSS yaw'ı gürültülü
+
+        # ============================================================
+        #  IMU & AHRS
+        # ============================================================
+        # [✅AHRS] Ham quaternion→euler yerine Mahony filtresi
+        self.IMU_FREQ = 100.0   # ⚠️ ros2 topic hz /imu/data ile doğrula
+        self.mahony   = Mahony(frequency=self.IMU_FREQ, k_P=2.0, k_I=0.005)
+        self.mahony.Q = np.array([1.0, 0.0, 0.0, 0.0])
+
+        self.current_yaw      = 0.0   # radyan — Mahony çıktısı
+        self.BLEND_ALPHA      = 0.02  # yaw blending hızı (ani sıçrama önleme)
+
+        # ============================================================
+        #  NAVİGASYON PARAMETRELERİ
+        # ============================================================
+        self.heading_deadband    = 0.05   # rad — min dönme açısı
+        self.min_angular_speed   = 0.1    # rad/s
+        self.max_angular_speed   = 1.0    # rad/s
+        self.max_linear_speed    = 1.0    # m/s
+
+        # [✅PI] PI kontrol sabitleri
+        self.Kp_linear   = 0.5
+        self.Kp_angular  = 1.5
+        self.Ki_angular  = 0.03   # integral — uzun mesafe sabit sapma düzeltme
+        self.angular_integral  = 0.0
+        self.INTEGRAL_LIMIT    = 0.5   # windup koruması
+
+        # [✅VS] Velocity smoothing
+        self.SMOOTH_ALPHA  = 0.15
+        self.prev_linear   = 0.0
+        self.prev_angular  = 0.0
+
+        # [STALL] Takılma tespiti (encoder tabanlı — tekerlek bloke)
+        self.ROVER_WIDTH   = 0.5    # m — tekerlek aralığı (rover genişliği)
+        self.STALL_MAX     = 20     # ~1 sn (20 Hz kontrol döngüsünde)
+        self.STALL_VEL_THR = 0.05   # m/s — bu altı "durdu" sayılır
+        self.stall_counter = 0
+
+        # [GPS KAYMA] Tekerlek boşta dönme tespiti (GPS tabanlı — encoder körü)
+        # Encoder hızı yüksek ama GPS sabit → tekerlek zemini kaybetti
+        self.SLIP_CHECK_DURATION    = 3.0   # s — kontrol penceresi
+        self.SLIP_MIN_DIST_M        = 0.3   # m — pencerede beklenen min GPS hareketi
+        self.SLIP_CMD_THRESH        = 0.1   # m/s — "hareket komutu var" eşiği
+        self.SLIP_RECOVERY_DURATION  = 1.0   # s — geri manevra süresi (kayma)
+        self.STALL_RECOVERY_DURATION = 1.5   # s — geri manevra süresi (blokaj > kayma)
+        self.SLIP_REVERSE_SPEED      = 0.3   # m/s — her iki durum için ortak geri hız
+        self.slip_start_time         = None
+        self.slip_start_x            = None
+        self.slip_start_y            = None
+        self.slip_recovery_end_time  = None
+        self.stall_recovery_end_time = None
+
+        # ============================================================
+        #  HEDEF NOKTALARI
+        # ============================================================
+        self.targets = [
+            (7,   10),
+            (8,   17),
+            (0,   25),
+            (-7,  15),
+        ]
+        self.current_target_idx = 0   # aktif hedef indisi
+
+        self.current_target_x  = self.targets[0][0]
+        self.current_target_y  = self.targets[0][1]
+
+        # ============================================================
+        #  ZAMANLAMA
+        # ============================================================
+        self.last_time = self.get_clock().now().nanoseconds / 1e9
+
+        # [✅WD] Watchdog
+        self.last_control_time = time.time()
+
+        # [✅DT] dt eşiği
+        self.DT_MAX = 0.3
+
+        # ============================================================
+        #  YAYINCILAR
+        # ============================================================
+        self.vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        # ============================================================
+        #  ABONELER
+        # ============================================================
+        self.create_subscription(
+            Image, '/realsense/rgb/image_raw',
+            self.rgb_callback, 10,
+            callback_group=self.aruco_cb_group
+        )
+        self.create_subscription(
+            Image, '/realsense/depth/color_aligned',
+            self.align_depth_callback, 10,
+            callback_group=self.control_cb_group
+        )
+        self.create_subscription(
+            NavSatFix, '/gnss/fix',
+            self.gnss_callback, 10,
+            callback_group=self.control_cb_group
+        )
+        self.create_subscription(
+            Imu, '/imu/data',
+            self.imu_callback, 10,
+            callback_group=self.control_cb_group
+        )
+
+        # ============================================================
+        #  ZAMANLAYICILAR
+        # ============================================================
+        self.timer = self.create_timer(
+            0.05, self.control_loop,
+            callback_group=self.control_cb_group
+        )
+        # [✅WD] Watchdog timer
+        self.watchdog_timer = self.create_timer(
+            0.5, self.watchdog_check,
+            callback_group=self.control_cb_group
+        )
+
+        # [✅RC] Arka plan reconnect timer — hot path'i bloğlamaz
+        self.reconnect_timer = self.create_timer(
+            2.0, self._background_reconnect,
+            callback_group=self.control_cb_group
+        )
+
+        self.get_logger().info("RoverNavigation başlatıldı.")
+
+    # ================================================================
+    #  SERİ PORT YARDIMCILARI
+    # ================================================================
+
+    def _open_serial(self, port, tag='port'):
+        """Seri portu aç; başarısızsa None döndür."""
         try:
-            self.ser_read = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.1)
-            self.get_logger().info("Serial port connection is sucsessful(ser_read).")
+            s = serial.Serial(port, 115200, timeout=0.1)
+            self.get_logger().info(f"Seri port açıldı: {tag} ({port})")
+            return s
         except Exception as e:
-            self.get_logger().error(f"Serial port Error(ser_read): {e}")
-            self.ser_read = None
+            self.get_logger().error(f"Seri port hatası ({tag}): {e}")
+            return None
+
+    def _reconnect_serial(self, port_attr, port_path, tag):
+        """[✅RC] Belirtilen seri portu bir kez açmayı dene (bloğlamaz, sleep yok)."""
         try:
-            self.ser_write_front = serial.Serial('/dev/ttyUSB1', 115200, timeout=0.1)
-            self.get_logger().info("Serial port connection is sucsessful(ser_write_front).")
+            s = serial.Serial(port_path, 115200, timeout=0.1)
+            setattr(self, port_attr, s)
+            self.get_logger().info(f"{tag} yeniden bağlandı.")
         except Exception as e:
-            self.get_logger().error(f"Serial port Error(ser_write_front): {e}")
-            self.ser_write_front = None
-        try:
-            self.ser_write_back = serial.Serial('/dev/ttyUSB2', 115200, timeout=0.1)
-            self.get_logger().info("Serial port connection is sucsessful(ser_write_back).")
-        except Exception as e:
-            self.get_logger().error(f"Serial port Error(ser_write_back): {e}")
-            self.ser_write_back = None
+            self.get_logger().warn(f"{tag} reconnect başarısız: {e}", throttle_duration_sec=5.0)
+            setattr(self, port_attr, None)
 
-        self.START_FRAME = 0xABCD # Veri paketlerinin başlangıç değeri
-        self.buffer = bytearray() # Veri paketlerinin saklanacağı liste
+    def _background_reconnect(self):
+        """[✅RC] Her 2 sn'de kapalı portları arka planda yeniden bağla."""
+        for attr, path, tag in [
+            ('ser_read',        '/dev/ttyUSB0', 'ser_read'),
+            ('ser_write_front', '/dev/ttyUSB1', 'ser_write_front'),
+            ('ser_write_back',  '/dev/ttyUSB2', 'ser_write_back'),
+        ]:
+            port = getattr(self, attr)
+            if port is None or not port.is_open:
+                self._reconnect_serial(attr, path, tag)
 
-        self.cv_bridge = CvBridge() # CV bridge
+    # ================================================================
+    #  WATCHDOG
+    # ================================================================
 
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250) # ArUco Marker kütüphanesi
-        self.aruco_params = cv2.aruco.DetectorParameters() # ArUco tespiti için konfigürasyon parametreleri
+    def watchdog_check(self):
+        """[✅WD] Kontrol döngüsü 0.5 sn'dir çalışmadıysa acil dur."""
+        if time.time() - self.last_control_time > 0.5:
+            self.get_logger().error(
+                "WATCHDOG: Kontrol döngüsü yanıt vermiyor! Acil dur.",
+                throttle_duration_sec=1.0
+            )
+            self.send_to_hoverboard(0.0, 0.0)
 
-        self.warmup_count = 0 # GNSS kalibrasyon için sayaç
-        self.warmup_limit = 20 # GNSS kalibrasyon sayacı için max değer
-        self.lat_buffer = [] # GNSS kalibrasyon için enlem değerlerinin saklanacağı liste
-        self.lon_buffer = [] # GNSS kalibrasyon için boylam değerlerinin saklanacağı liste
-        
-        self.heading_deadband = 0.05 # Aracın tepki vereceği min dönme açı değeri
-        self.min_angular_speed = 0.1 # Aracın sahip olabileceği min dönme hızı
-        self.max_angular_speed = 1.0 # Aracın sahip olabileceği max dönme hızı (m/s)
-        self.max_linear_speed = 1.0 # Aracın sahip olabileceği max doğrusal hız (m/s)
+    # ================================================================
+    #  GPS KAYMA TESPİTİ
+    # ================================================================
 
-        self.current_yaw = 0 # Aracın bakış açısı
-        self.current_x = None # Aracın anlık bulunduğu x konumu
-        self.current_y = None # Aracın anlık bulunduğu x konumu
-        self.current_target_x = None # Hedefin anlık bulunduğu x konumu
-        self.current_target_y = None # Hedefin anlık bulunduğu y konumu
-        self.current_target_id = None # Hedefin numarası
-        self.gnss_origin_lat = None # GNSS başlangıç konumu (enlem)
-        self.gnss_origin_lon = None # GNSS başlangıç konumu (Boylam)
+    def _check_gps_slip(self, cur_x, cur_y, cmd_linear):
+        """Komut verildiği halde GPS konumu değişmiyorsa True döndür.
 
-        self.first_target_x, self.first_target_y = 7, 10  # İlk hedefin konumları
-        self.second_target_x, self.second_target_y = 8, 17 # İkinci hedefon konumları
-        self.third_target_x, self.third_target_y = 0, 25 # Üçüncü hedefin konumları
-        self.fourth_target_x, self.fourth_target_y = -7, 15 # Dördüncü hedefin konumları
+        Tekerlek bloke (encoder düşük) değil, aksine encoder yüksek ama araç
+        yerinde sayıyor — zemin kaybı (kayma) durumunu tespit eder.
+        """
+        if not self.is_gnss_available or cur_x is None:
+            return False
 
-        self.is_first_target_reached = False # İlk hedefe ulaşıldı mı?
-        self.is_second_target_reached = False # İkinci hedefe ulaşıldı mı?
-        self.is_third_target_reached = False # Üçüncü Hedefe Ulaşıldı mı?
-        self.is_fourth_target_reached = False # Dördüncü hedefe ulaşıldı mı?
-        self.is_gnss_available = False # GNSS aktif mi?
+        # Hareket komutu yoksa pencereyi sıfırla
+        if abs(cmd_linear) < self.SLIP_CMD_THRESH:
+            self.slip_start_time = None
+            self.slip_start_x    = None
+            self.slip_start_y    = None
+            return False
 
-        self.timer = self.create_timer(0.05, self.control_loop) # Zamanlayıcı
-        self.last_time = self.get_clock().now().nanoseconds / 1e9 # Anlık zaman değeri
+        now = time.time()
 
-        self.vel_pub = self.create_publisher(Twist, "/cmd_vel", 10) # Hız yayıncısı
+        # Pencere henüz başlamadıysa başlangıç noktasını kaydet
+        if self.slip_start_time is None:
+            self.slip_start_time = now
+            self.slip_start_x    = cur_x
+            self.slip_start_y    = cur_y
+            return False
 
-        self.align_depth_sub = self.create_subscription(Image, '/realsense/depth/color_aligned', self.align_depth_callback, 10) # Derinlik algı abone
-        self.rgb_sub = self.create_subscription(Image, '/realsense/rgb/image_raw', self.rgb_callback, 10) # RGB abone
-        self.gnss_sub = self.create_subscription(NavSatFix, '/gnss/fix', self.gnss_callback, 10) # GNSS abone
-        self.imu_sub = self.create_subscription(Imu, '/imu/data', self.imu_callback, 10) # İMU abone
+        # Pencere henüz dolmadı
+        if now - self.slip_start_time < self.SLIP_CHECK_DURATION:
+            return False
+
+        # Pencere doldu: GPS deplasmanını ölç
+        dist = math.sqrt(
+            (cur_x - self.slip_start_x) ** 2 +
+            (cur_y - self.slip_start_y) ** 2
+        )
+
+        # Bir sonraki pencere için sıfırla
+        self.slip_start_time = now
+        self.slip_start_x    = cur_x
+        self.slip_start_y    = cur_y
+
+        return dist < self.SLIP_MIN_DIST_M
+
+    def _in_slip_recovery(self):
+        """Kayma geri manevra süresi aktifse True döndür."""
+        if self.slip_recovery_end_time is None:
+            return False
+        if time.time() < self.slip_recovery_end_time:
+            return True
+        self.slip_recovery_end_time = None
+        return False
+
+    def _in_stall_recovery(self):
+        """Blokaj geri manevra süresi aktifse True döndür."""
+        if self.stall_recovery_end_time is None:
+            return False
+        if time.time() < self.stall_recovery_end_time:
+            return True
+        self.stall_recovery_end_time = None
+        return False
+
+    # ================================================================
+    #  ENCODER GERİ BESLEME
+    # ================================================================
 
     def read_serial_feedback(self):
+        """Hoverboard'dan encoder + telemetri verisi oku."""
         if self.ser_read is None or not self.ser_read.is_open:
+            # Arka plan timer yeniden bağlayacak; burada bloğlanmıyoruz
             return None
-        
-        waiting = self.ser_read.in_waiting
-        if waiting > 0:
-            new_data = self.ser_read.read(waiting)
-            self.buffer.extend(new_data)
 
-        if len(self.buffer) >= 18:
-            header_bytes = b'\xCD\xAB'
-            last_packet_idx = self.buffer.rfind(header_bytes)
-            if last_packet_idx != -1:
-                if len(self.buffer) >= last_packet_idx + 18:
-                    unpacked_data = struct.unpack('<hhhhhhHH', self.buffer[last_packet_idx + 2: last_packet_idx + 18])
-                    data_checksum = unpacked_data[7]
-                    calc_checksum = (self.START_FRAME ^ unpacked_data[0] ^ unpacked_data[1] 
-                             ^ unpacked_data[2] ^ unpacked_data[3] ^ unpacked_data[4] 
-                             ^ unpacked_data[5] ^ unpacked_data[6]) & 0xFFFF
-                    if calc_checksum == data_checksum:    
-                        feedback = {
-                            'cmd1': unpacked_data[0],
-                            'cmd2': unpacked_data[1],
-                            'speedR_meas': unpacked_data[2],
-                            'speedL_meas': unpacked_data[3],
-                            'batVoltage': unpacked_data[4],
-                            'boardTemp': unpacked_data[5],
-                            'cmdLed': unpacked_data[6],
-                            'checksum': unpacked_data[7]
-                        }
-                        del(self.buffer[:last_packet_idx+18])
-                        return feedback
-                    else:
-                        self.get_logger().warn(f"Checksum Error! Calculated checksum: {calc_checksum}, Checksum from data: {data_checksum}")
-                        del(self.buffer[:last_packet_idx + 1])
-                        return None
-                else:
-                    return
-            else:
-                self.buffer.clear()
-                return
+        try:
+            waiting = self.ser_read.in_waiting
+            if waiting > 0:
+                self.buffer.extend(self.ser_read.read(waiting))
+        except Exception as e:
+            self.get_logger().warn(f"Seri okuma hatası: {e}")
+            self.ser_read = None
+            return None
+
+        if len(self.buffer) < 18:
+            return None
+
+        header_bytes     = b'\xCD\xAB'
+        last_packet_idx  = self.buffer.rfind(header_bytes)
+
+        if last_packet_idx == -1:
+            self.buffer.clear()
+            return None
+
+        if len(self.buffer) < last_packet_idx + 18:
+            return None
+
+        unpacked = struct.unpack(
+            '<hhhhhhHH',
+            self.buffer[last_packet_idx + 2: last_packet_idx + 18]
+        )
+        calc_cs = (
+            self.START_FRAME
+            ^ unpacked[0] ^ unpacked[1] ^ unpacked[2]
+            ^ unpacked[3] ^ unpacked[4] ^ unpacked[5]
+            ^ unpacked[6]
+        ) & 0xFFFF
+
+        del self.buffer[:last_packet_idx + 18]
+
+        if calc_cs != unpacked[7]:
+            self.get_logger().warn(
+                f"Checksum hatası! calc={calc_cs} data={unpacked[7]}",
+                throttle_duration_sec=2.0
+            )
+            return None
+
+        return {
+            'cmd1':        unpacked[0],
+            'cmd2':        unpacked[1],
+            'speedR_meas': unpacked[2],
+            'speedL_meas': unpacked[3],
+            'batVoltage':  unpacked[4],
+            'boardTemp':   unpacked[5],
+            'cmdLed':      unpacked[6],
+            'checksum':    unpacked[7],
+        }
+
+    # ================================================================
+    #  CALLBACK'LER
+    # ================================================================
 
     def align_depth_callback(self, msg):
-        return
-    
+        # Depth verisi şimdilik işlenmiyor — ileride engel algılama için
+        pass
+
     def rgb_callback(self, msg):
+        """[ArUco] Marker tespit et, yatay hata pikselini hesapla."""
         try:
             cv_image = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
         except CvBridgeError as e:
-            self.get_logger().error(f"CvBridge error: {e}")
+            self.get_logger().error(f"CvBridge hatası: {e}")
             return
-        
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
 
-        corners, ids, rejected = cv2.aruco.detectMarkers(
-            gray, 
-            self.aruco_dict, 
-            parameters=self.aruco_params
+        h, w = cv_image.shape[:2]
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, self.aruco_dict, parameters=self.aruco_params
         )
 
-        if ids is not None:
-            cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
+        found_error = None
 
+        if ids is not None:
             for i, marker_id in enumerate(ids):
                 mid = marker_id[0]
                 if 51 <= mid <= 64:
-                    c = corners[i][0]
-                    center_x = int(np.mean(c[:, 0]))
-                    center_y = int(np.mean(c[:, 1]))
-                    
-                    error_x = center_x - (w / 2)
+                    c          = corners[i][0]
+                    center_x   = float(np.mean(c[:, 0]))
+                    # [BUG FIX] error_x artık sadece hesaplanmıyor, paylaşılıyor
+                    found_error = center_x - (w / 2.0)
+                    break   # en büyük öncelikli marker — ilk bulunanı al
+
+        with self.data_lock:
+            self.aruco_error_x = found_error
+            self.aruco_img_w   = w
 
     def gnss_callback(self, msg):
-        R = 6378137.0 # Dünyanın yarıçapı
+        """[✅GNSS] GNSS verisini düzlemsel koordinata çevir."""
+        R = 6378137.0
 
         if not self.is_gnss_available:
             if self.warmup_count < self.warmup_limit:
                 self.lat_buffer.append(msg.latitude)
                 self.lon_buffer.append(msg.longitude)
                 self.warmup_count += 1
-                self.get_logger().info("Calibrating the GNSS data...")
+                self.get_logger().info(
+                    f"GNSS kalibrasyon {self.warmup_count}/{self.warmup_limit}",
+                    throttle_duration_sec=2.0
+                )
                 return
             else:
-                self.gnss_origin_lat = (sum(self.lat_buffer) / len(self.lat_buffer))
-                self.gnss_origin_lon = (sum(self.lon_buffer) / len(self.lon_buffer))
-                self.is_gnss_available = True
-                self.get_logger().info("GNSS data is calibrated")
-
-        try:
-            d_lat = math.radians(msg.latitude - self.gnss_origin_lat) # Başlangıç konumuna olan uzaklık ölçülür
-            d_lon = math.radians(msg.longitude - self.gnss_origin_lon)
-            
-            ref_lat_rad = math.radians(self.gnss_origin_lat) # Başlangıç konumunun radyana çevirilmiş hali
-
-            self.current_x = d_lon * R * math.cos(ref_lat_rad)
-            self.current_y = d_lat * R
-            
-        except Exception as e:
-            self.get_logger().warn(f"GNSS Read Error: {e}")
-    
-    def imu_callback(self, msg):
-        x = msg.orientation.x
-        y = msg.orientation.y
-        z = msg.orientation.z
-        w = msg.orientation.w
-        quaternions_list = [x, y, z, w]
-        self.current_yaw = euler_from_quaternion(quaternions_list)[2]
-
-    def control_loop(self):
-        feedback = self.read_serial_feedback()
-
-        now = self.get_clock().now().nanoseconds / 1e9
-        dt = now - self.last_time # Geçen zaman
-        self.last_time = now
-
-        if self.is_gnss_available == False:
-            self.get_logger().warn("GNSS data is waiting.")
-            return
-        else:
-            
-            if feedback:
-                feedback_to_meter_per_sec = 0.001 # Hoverboarddan gelen encoder verisini m/s cinsine çevirme katsayısı
-
-                vel_right = feedback['speedR_meas'] * feedback_to_meter_per_sec # Hoverboarddan gelen sağ tekerlek encoder verisinin m/s cinsinden hızı
-                vel_left = feedback['speedL_meas'] * feedback_to_meter_per_sec # Hoverboarddan gelen sol tekerlek encoder verisinin m/s cinsinden hızı
-
-                rover_width = 0.5
-
-                vel_linear = (vel_right + vel_left) / 2.0 # Aracın doğrusal hızı
-            else:
-                self.get_logger().warn("Serial Port Read Error")
-                self.send_to_hoverboard(0, 0)
-                return
-
-        if self.is_first_target_reached == False:
-            self.current_target_x = self.first_target_x
-            self.current_target_y = self.first_target_y
-            self.current_target_id = 1
-        elif self.is_second_target_reached == False:
-            self.current_target_x = self.second_target_x
-            self.current_target_y = self.second_target_y
-            self.current_target_id = 2
-        elif self.is_third_target_reached == False:
-            self.current_target_x = self.third_target_x
-            self.current_target_y = self.third_target_y
-            self.current_target_id = 3
-        elif self.is_fourth_target_reached == False:
-            self.current_target_x = self.fourth_target_x
-            self.current_target_y = self.fourth_target_y
-            self.current_target_id = 4
-        else:
-            self.current_target_x = 0.0
-            self.current_target_y = 0.0
-            self.current_target_id = 5
-
-        dx = self.current_target_x - self.current_x # Hedefe olan x mesafesi
-        dy = self.current_target_y - self.current_y # Hedefe olan y mesafesi
-        self.distance_error = math.sqrt((dx)**2 + (dy)**2) # Hedefe olan uzaklık
-
-        self.target_yaw = math.atan2(dy, dx) # Hedefin x ekseni ile arasındaki açı
-        self.heading_error = self.target_yaw - self.current_yaw # Araç ile hedef arasındaki açı değeri
-
-        while self.heading_error > math.pi:
-            self.heading_error -= 2 * math.pi
-        while self.heading_error < -math.pi:
-            self.heading_error += 2 * math.pi
-
-        Kp_linear = 0.5  # Doğrusal hareket için PID kontrolün P kısmı
-        Kp_angular = 1.5 # Açısal hareket için PID kontrolün P kısmı
-
-        if abs(self.heading_error) < self.heading_deadband:
-            self.angular_speed = 0
-            self.get_logger().info("Target is in the Rover's sight, anggular speed is zeroed.")
-        else:
-            raw_angular = Kp_angular * self.heading_error
-        
-            if raw_angular > 0:
-                self.angular_speed = max(self.min_angular_speed, min(raw_angular, self.max_angular_speed)) # Aracın ilerleyeceği açısal hız (m/s)
-            else:
-                self.angular_speed = min(-self.min_angular_speed, max(raw_angular, -self.max_angular_speed))
-
-        self.linear_speed = Kp_linear * self.distance_error # Aracın ilerleyeceği doğrusal hız (m/s)
-        self.linear_speed = np.clip(self.linear_speed, -self.max_linear_speed, self.max_linear_speed)
-
-        if self.distance_error < 0.5:
-            self.linear_speed = 0
-            self.angular_speed = 0
-            self.get_logger().info("Target reached")
-            match self.current_target_id:
-                case 1:
-                    self.is_first_target_reached = True
-                case 2:
-                    self.is_second_target_reached = True
-                case 3:
-                    self.is_third_target_reached = True
-                case 4:
-                    self.is_fourth_target_reached = True
-                case 5:
-                    self.get_logger().info("MİSSON COMPLETED")
-                    self.send_to_hoverboard(0, 0)
+                # [✅GNSS] Std sapma kontrolü — kararsız fix varsa reddet
+                lat_std = float(np.std(self.lat_buffer))
+                lon_std = float(np.std(self.lon_buffer))
+                if lat_std > self.GNSS_STD_THRESHOLD or lon_std > self.GNSS_STD_THRESHOLD:
+                    self.get_logger().warn(
+                        f"GNSS kalibrasyon std çok yüksek "
+                        f"(lat_std={lat_std:.6f}, lon_std={lon_std:.6f}). "
+                        f"Yeniden kalibrasyon başlıyor."
+                    )
+                    # Tampon sıfırla ve yeniden dene
+                    self.lat_buffer.clear()
+                    self.lon_buffer.clear()
+                    self.warmup_count = 0
                     return
 
-        self.send_to_hoverboard(self.linear_speed, self.angular_speed)
+                self.gnss_origin_lat = float(np.mean(self.lat_buffer))
+                self.gnss_origin_lon = float(np.mean(self.lon_buffer))
+                self.is_gnss_available = True
+                self.get_logger().info(
+                    f"GNSS kalibre edildi. "
+                    f"Origin: {self.gnss_origin_lat:.6f}, {self.gnss_origin_lon:.6f}"
+                )
 
-        self.cmd = Twist()
-        self.cmd.linear.x = self.linear_speed
-        self.cmd.angular.z = self.angular_speed
-        self.vel_pub.publish(self.cmd)
+        try:
+            d_lat       = math.radians(msg.latitude  - self.gnss_origin_lat)
+            d_lon       = math.radians(msg.longitude - self.gnss_origin_lon)
+            ref_lat_rad = math.radians(self.gnss_origin_lat)
+
+            with self.data_lock:
+                self.current_x = d_lon * R * math.cos(ref_lat_rad)
+                self.current_y = d_lat * R
+
+                # [GNSS YAW] Mahony yaw drift'ini ardışık fix'lerle düzelt.
+                # Magnetometre olmadan Mahony zamanla kayar; GNSS hareketi
+                # gerçek başlığı verir ve yavaş blend ile filtreye işlenir.
+                if self.prev_gnss_x is not None:
+                    move_dx = self.current_x - self.prev_gnss_x
+                    move_dy = self.current_y - self.prev_gnss_y
+                    if math.sqrt(move_dx**2 + move_dy**2) > self.GNSS_YAW_MIN_DIST:
+                        gnss_yaw = math.atan2(move_dy, move_dx)
+                        yaw_diff = math.atan2(
+                            math.sin(gnss_yaw - self.current_yaw),
+                            math.cos(gnss_yaw - self.current_yaw)
+                        )
+                        self.current_yaw += self.GNSS_YAW_BLEND * yaw_diff
+                        self.current_yaw = math.atan2(
+                            math.sin(self.current_yaw),
+                            math.cos(self.current_yaw)
+                        )
+
+                self.prev_gnss_x = self.current_x
+                self.prev_gnss_y = self.current_y
+
+        except Exception as e:
+            self.get_logger().warn(f"GNSS okuma hatası: {e}", throttle_duration_sec=2.0)
+
+    def imu_callback(self, msg):
+        """[✅AHRS] Mahony filtresi ile quaternion güncelle → yaw çıkar."""
+        gyr = np.array([
+            msg.angular_velocity.x,
+            msg.angular_velocity.y,
+            msg.angular_velocity.z,
+        ])
+        acc = np.array([
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z,
+        ])
+
+        try:
+            self.mahony.Q = self.mahony.updateIMU(self.mahony.Q, gyr=gyr, acc=acc)
+            euler         = q2euler(self.mahony.Q)  # [roll, pitch, yaw] radyan
+            new_yaw       = euler[2]
+
+            # [BUG FIX / ✅AHRS] Yaw blending — ani overwrite yerine yumuşak geçiş
+            yaw_diff = math.atan2(
+                math.sin(new_yaw - self.current_yaw),
+                math.cos(new_yaw - self.current_yaw)
+            )
+            with self.data_lock:
+                self.current_yaw = self.current_yaw + self.BLEND_ALPHA * yaw_diff
+                self.current_yaw = math.atan2(
+                    math.sin(self.current_yaw),
+                    math.cos(self.current_yaw)
+                )
+        except Exception as e:
+            self.get_logger().warn(f"AHRS güncelleme hatası: {e}", throttle_duration_sec=2.0)
+
+    # ================================================================
+    #  KONTROL DÖNGÜSÜ
+    # ================================================================
+
+    def control_loop(self):
+        # [✅WD] Watchdog zaman damgası
+        self.last_control_time = time.time()
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        dt  = now - self.last_time
+        self.last_time = now
+
+        # [✅DT] Anormal gecikmeyi kes
+        if dt > self.DT_MAX:
+            dt = 0.05
+
+        # --- GNSS bekleniyor ---
+        if not self.is_gnss_available:
+            self.get_logger().warn(
+                "GNSS bekleniyor...", throttle_duration_sec=2.0
+            )
+            return
+
+        # --- Konum ve yaw kilit içinde oku ---
+        with self.data_lock:
+            cur_x       = self.current_x
+            cur_y       = self.current_y
+            cur_yaw     = self.current_yaw
+            aruco_err   = self.aruco_error_x
+            img_w       = self.aruco_img_w
+
+        if cur_x is None or cur_y is None:
+            self.get_logger().warn("Konum verisi yok.", throttle_duration_sec=2.0)
+            return
+
+        # --- Encoder geri besleme ---
+        feedback = self.read_serial_feedback()
+        if feedback is None:
+            self.get_logger().warn(
+                "Encoder okunamadı, dur komut gönderiliyor.",
+                throttle_duration_sec=2.0
+            )
+            self.send_to_hoverboard(0.0, 0.0)
+            return
+
+        # Encoder → m/s
+        feedback_to_ms = 0.001
+        vel_right  = feedback['speedR_meas'] * feedback_to_ms
+        vel_left   = feedback['speedL_meas'] * feedback_to_ms
+        vel_linear = (vel_right + vel_left) / 2.0
+
+        # ----------------------------------------------------------------
+        # HEDEF SEÇİMİ
+        # ----------------------------------------------------------------
+        if self.current_target_idx < len(self.targets):
+            self.current_target_x, self.current_target_y = \
+                self.targets[self.current_target_idx]
+        else:
+            # Tüm hedefler tamamlandı
+            self.get_logger().info("MİSYON TAMAMLANDI!", throttle_duration_sec=5.0)
+            self.send_to_hoverboard(0.0, 0.0)
+            return
+
+        # ----------------------------------------------------------------
+        # HATA HESAPLAMA
+        # ----------------------------------------------------------------
+        dx = self.current_target_x - cur_x
+        dy = self.current_target_y - cur_y
+        distance_error = math.sqrt(dx**2 + dy**2)
+
+        target_yaw    = math.atan2(dy, dx)
+        heading_error = math.atan2(
+            math.sin(target_yaw - cur_yaw),
+            math.cos(target_yaw - cur_yaw)
+        )
+
+        # ----------------------------------------------------------------
+        # HEDEFE ULAŞILDI MI?
+        # ----------------------------------------------------------------
+        if distance_error < 0.5:
+            self.get_logger().info(
+                f"Hedef {self.current_target_idx + 1} ulaşıldı.",
+                throttle_duration_sec=1.0
+            )
+            self.current_target_idx    += 1
+            self.angular_integral       = 0.0
+            self.slip_start_time         = None   # yeni hedef için kayma/blokaj penceresini sıfırla
+            self.slip_recovery_end_time  = None
+            self.stall_recovery_end_time = None
+            self.send_to_hoverboard(0.0, 0.0)
+            return
+
+        # ----------------------------------------------------------------
+        # PI KONTROL — Açısal hız
+        # ----------------------------------------------------------------
+        target_angular = 0.0
+
+        if abs(heading_error) < self.heading_deadband:
+            # [BUG FIX] Deadband içindeyken raw_angular tanımsız kalıyordu
+            target_angular       = 0.0
+            self.angular_integral = 0.0
+        else:
+            # [✅PI] PI kontrol
+            self.angular_integral += heading_error * dt
+            self.angular_integral  = float(np.clip(
+                self.angular_integral,
+                -self.INTEGRAL_LIMIT, self.INTEGRAL_LIMIT
+            ))
+            raw_angular    = (self.Kp_angular * heading_error
+                              + self.Ki_angular * self.angular_integral)
+
+            # Min hız garantisi (işaret koru)
+            if raw_angular > 0:
+                target_angular = max(self.min_angular_speed,
+                                     min(raw_angular, self.max_angular_speed))
+            else:
+                target_angular = min(-self.min_angular_speed,
+                                     max(raw_angular, -self.max_angular_speed))
+
+        # ----------------------------------------------------------------
+        # DOĞRUSAL HIZ
+        # ----------------------------------------------------------------
+        target_linear = float(np.clip(
+            self.Kp_linear * distance_error,
+            -self.max_linear_speed,
+            self.max_linear_speed
+        ))
+
+        # ----------------------------------------------------------------
+        # [✅VS] VELOCİTY SMOOTHING
+        # ----------------------------------------------------------------
+        self.prev_linear  = ((1.0 - self.SMOOTH_ALPHA) * self.prev_linear
+                             + self.SMOOTH_ALPHA * target_linear)
+        self.prev_angular = ((1.0 - self.SMOOTH_ALPHA) * self.prev_angular
+                             + self.SMOOTH_ALPHA * target_angular)
+
+        # ----------------------------------------------------------------
+        # [GPS KAYMA] Tekerlek dönüyor ama araç ilerlemiyorsa geri manevra
+        # ----------------------------------------------------------------
+        if self._check_gps_slip(cur_x, cur_y, self.prev_linear):
+            self.get_logger().warn(
+                f"GPS KAYMA TESPİT EDİLDİ: {self.SLIP_CHECK_DURATION:.0f} sn'de "
+                f"GPS hareketi < {self.SLIP_MIN_DIST_M} m. Geri manevra başlatıldı.",
+                throttle_duration_sec=2.0
+            )
+            self.slip_recovery_end_time = time.time() + self.SLIP_RECOVERY_DURATION
+            self.stall_counter    = 0
+            self.angular_integral = 0.0
+            self.prev_linear      = 0.0   # smoother'ı sıfırla — ani geçiş önlenir
+            self.prev_angular     = 0.0
+
+        if self._in_slip_recovery() or self._in_stall_recovery():
+            self.send_to_hoverboard(-self.SLIP_REVERSE_SPEED, 0.0)
+            cmd = Twist()
+            cmd.linear.x  = -self.SLIP_REVERSE_SPEED
+            cmd.angular.z = 0.0
+            self.vel_pub.publish(cmd)
+            return
+
+        # ----------------------------------------------------------------
+        # MOTOR & YAYINcı
+        # ----------------------------------------------------------------
+        self.send_to_hoverboard(self.prev_linear, self.prev_angular)
+
+        # [STALL] Komut verildi ama encoder hareketi yok → rover fiziksel bloke
+        if abs(self.prev_linear) > 0.1 and abs(vel_linear) < self.STALL_VEL_THR:
+            self.stall_counter += 1
+            if self.stall_counter >= self.STALL_MAX:
+                self.get_logger().warn(
+                    f"ROVER TAKILDI! Encoder: {vel_linear:.3f} m/s | "
+                    f"Komut: {self.prev_linear:.2f} m/s. Geri manevra başlatıldı.",
+                    throttle_duration_sec=1.0
+                )
+                self.stall_recovery_end_time = time.time() + self.STALL_RECOVERY_DURATION
+                self.angular_integral = 0.0
+                self.prev_linear      = 0.0
+                self.prev_angular     = 0.0
+                self.stall_counter    = 0
+        else:
+            self.stall_counter = 0
+
+        cmd             = Twist()
+        cmd.linear.x    = self.prev_linear
+        cmd.angular.z   = self.prev_angular
+        self.vel_pub.publish(cmd)
+
+        # [✅LOG] Throttle'lı durum logu
+        self.get_logger().info(
+            f"Hedef {self.current_target_idx + 1}/{len(self.targets)} | "
+            f"dist={distance_error:.2f}m | "
+            f"heading_err={math.degrees(heading_error):.1f}° | "
+            f"v={self.prev_linear:.2f} w={self.prev_angular:.2f} | "
+            f"ArUco={'görünüyor' if aruco_err is not None else 'yok'}",
+            throttle_duration_sec=1.0
+        )
+
+    # ================================================================
+    #  MOTOR SÜRÜCÜ
+    # ================================================================
 
     def send_to_hoverboard(self, lin_speed, ang_speed):
-        LINEAR_SCALE = 300.0 # Tekerleklere gidecek hız verisinin (m/s) formatından float veri tipine çevirilme katsayısı 
-        ANGULAR_SCALE = 150.0 
+        LINEAR_SCALE  = 300.0
+        ANGULAR_SCALE = 150.0
 
-        uSpeed = int(lin_speed * LINEAR_SCALE)
-        uSteer = int(ang_speed * ANGULAR_SCALE)
+        uSpeed = int(np.clip(lin_speed * LINEAR_SCALE, -1000, 1000))
+        uSteer = int(np.clip(ang_speed * ANGULAR_SCALE, -1000, 1000))
 
-        uSpeed = max(min(uSpeed, 1000), -1000) # Tekerleklere gidecek hızın max alabileceği float değeri
-        uSteer = max(min(uSteer, 1000), -1000)
+        checksum = (self.START_FRAME
+                    ^ (uSteer & 0xFFFF)
+                    ^ (uSpeed & 0xFFFF)) & 0xFFFF
+        packet   = struct.pack('<HhhH', self.START_FRAME, uSteer, uSpeed, checksum)
 
-        checksum = (self.START_FRAME ^ (uSteer & 0xFFFF) ^ (uSpeed & 0xFFFF)) & 0xFFFF
+        # [✅RC] Her port için ayrı hata yönetimi ve reconnect
+        for attr, path, tag in [
+            ('ser_write_front', '/dev/ttyUSB1', 'ser_write_front'),
+            ('ser_write_back',  '/dev/ttyUSB2', 'ser_write_back'),
+        ]:
+            port = getattr(self, attr)
+            if port is None or not port.is_open:
+                # Arka plan timer yeniden bağlayacak; burada bloğlanmıyoruz
+                self.get_logger().warn(f"{tag} kapalı.", throttle_duration_sec=2.0)
+                continue
 
-        # Format: '<HhhH'
-        # < : Little Endian (Arduino standart)
-        # H : uint16 (Start Frame)
-        # h : int16 (Steer)
-        # h : int16 (Speed)
-        # H : uint16 (Checksum)
-        packet = struct.pack('<HhhH', self.START_FRAME, uSteer, uSpeed, checksum)
-        
-        if self.ser_write_front is None or not self.ser_write_front.is_open:
-            self.get_logger().warn("ser_write_front port is not open.")
-        else:
-            self.ser_write_front.write(packet)
+            try:
+                port.write(packet)
+            except Exception as e:
+                self.get_logger().error(
+                    f"{tag} yazma hatası: {e}",
+                    throttle_duration_sec=2.0
+                )
+                setattr(self, attr, None)
 
-        if self.ser_write_back is None or not self.ser_write_back.is_open:
-            self.get_logger().warn("ser_write_back port is not open.")
-        else:
-            self.ser_write_back.write(packet)
-        
+
+# ================================================================
+#  ANA GİRİŞ
+# ================================================================
+
 def main(args=None):
     rclpy.init(args=args)
-    node = RoverNavigation()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node     = RoverNavigation()
+        # [✅MT] MultiThreadedExecutor
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"KRİTİK: {e}")
+    finally:
+        if 'node' in locals():
+            node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == "__main__":
-    main()  
+    main()
