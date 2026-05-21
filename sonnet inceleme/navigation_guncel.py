@@ -78,7 +78,6 @@ class RoverNavigation(Node):
         # ArUco servoing verisi (kilitli paylaşım)
         self.aruco_error_x  = None   # piksel cinsinden yatay hata (None = marker yok)
         self.aruco_img_w    = 640    # varsayılan genişlik, rgb_callback'te güncellenir
-        self.ARUCO_Kp       = 0.003  # piksel→angular_speed oransal kazanç — sahada ayarla
 
         # ============================================================
         #  GNSS
@@ -134,11 +133,25 @@ class RoverNavigation(Node):
         self.prev_linear   = 0.0
         self.prev_angular  = 0.0
 
-        # [STALL] Takılma tespiti
+        # [STALL] Takılma tespiti (encoder tabanlı — tekerlek bloke)
         self.ROVER_WIDTH   = 0.5    # m — tekerlek aralığı (rover genişliği)
         self.STALL_MAX     = 20     # ~1 sn (20 Hz kontrol döngüsünde)
         self.STALL_VEL_THR = 0.05   # m/s — bu altı "durdu" sayılır
         self.stall_counter = 0
+
+        # [GPS KAYMA] Tekerlek boşta dönme tespiti (GPS tabanlı — encoder körü)
+        # Encoder hızı yüksek ama GPS sabit → tekerlek zemini kaybetti
+        self.SLIP_CHECK_DURATION    = 3.0   # s — kontrol penceresi
+        self.SLIP_MIN_DIST_M        = 0.3   # m — pencerede beklenen min GPS hareketi
+        self.SLIP_CMD_THRESH        = 0.1   # m/s — "hareket komutu var" eşiği
+        self.SLIP_RECOVERY_DURATION  = 1.0   # s — geri manevra süresi (kayma)
+        self.STALL_RECOVERY_DURATION = 1.5   # s — geri manevra süresi (blokaj > kayma)
+        self.SLIP_REVERSE_SPEED      = 0.3   # m/s — her iki durum için ortak geri hız
+        self.slip_start_time         = None
+        self.slip_start_x            = None
+        self.slip_start_y            = None
+        self.slip_recovery_end_time  = None
+        self.stall_recovery_end_time = None
 
         # ============================================================
         #  HEDEF NOKTALARI
@@ -262,6 +275,70 @@ class RoverNavigation(Node):
                 throttle_duration_sec=1.0
             )
             self.send_to_hoverboard(0.0, 0.0)
+
+    # ================================================================
+    #  GPS KAYMA TESPİTİ
+    # ================================================================
+
+    def _check_gps_slip(self, cur_x, cur_y, cmd_linear):
+        """Komut verildiği halde GPS konumu değişmiyorsa True döndür.
+
+        Tekerlek bloke (encoder düşük) değil, aksine encoder yüksek ama araç
+        yerinde sayıyor — zemin kaybı (kayma) durumunu tespit eder.
+        """
+        if not self.is_gnss_available or cur_x is None:
+            return False
+
+        # Hareket komutu yoksa pencereyi sıfırla
+        if abs(cmd_linear) < self.SLIP_CMD_THRESH:
+            self.slip_start_time = None
+            self.slip_start_x    = None
+            self.slip_start_y    = None
+            return False
+
+        now = time.time()
+
+        # Pencere henüz başlamadıysa başlangıç noktasını kaydet
+        if self.slip_start_time is None:
+            self.slip_start_time = now
+            self.slip_start_x    = cur_x
+            self.slip_start_y    = cur_y
+            return False
+
+        # Pencere henüz dolmadı
+        if now - self.slip_start_time < self.SLIP_CHECK_DURATION:
+            return False
+
+        # Pencere doldu: GPS deplasmanını ölç
+        dist = math.sqrt(
+            (cur_x - self.slip_start_x) ** 2 +
+            (cur_y - self.slip_start_y) ** 2
+        )
+
+        # Bir sonraki pencere için sıfırla
+        self.slip_start_time = now
+        self.slip_start_x    = cur_x
+        self.slip_start_y    = cur_y
+
+        return dist < self.SLIP_MIN_DIST_M
+
+    def _in_slip_recovery(self):
+        """Kayma geri manevra süresi aktifse True döndür."""
+        if self.slip_recovery_end_time is None:
+            return False
+        if time.time() < self.slip_recovery_end_time:
+            return True
+        self.slip_recovery_end_time = None
+        return False
+
+    def _in_stall_recovery(self):
+        """Blokaj geri manevra süresi aktifse True döndür."""
+        if self.stall_recovery_end_time is None:
+            return False
+        if time.time() < self.stall_recovery_end_time:
+            return True
+        self.stall_recovery_end_time = None
+        return False
 
     # ================================================================
     #  ENCODER GERİ BESLEME
@@ -552,35 +629,20 @@ class RoverNavigation(Node):
                 f"Hedef {self.current_target_idx + 1} ulaşıldı.",
                 throttle_duration_sec=1.0
             )
-            self.current_target_idx += 1
-            self.angular_integral = 0.0   # integratörü sıfırla
+            self.current_target_idx    += 1
+            self.angular_integral       = 0.0
+            self.slip_start_time         = None   # yeni hedef için kayma/blokaj penceresini sıfırla
+            self.slip_recovery_end_time  = None
+            self.stall_recovery_end_time = None
             self.send_to_hoverboard(0.0, 0.0)
             return
-
-        # ----------------------------------------------------------------
-        # ArUco SERVOİNG (marker görünürse angular speed'i override et)
-        # ----------------------------------------------------------------
-        aruco_active = False
-        if aruco_err is not None:
-            # Marker görünüyor → açı hatasını piksel hatasına göre belirle
-            aruco_angular = -self.ARUCO_Kp * aruco_err
-            aruco_angular = float(np.clip(
-                aruco_angular,
-                -self.max_angular_speed,
-                self.max_angular_speed
-            ))
-            aruco_active  = True
 
         # ----------------------------------------------------------------
         # PI KONTROL — Açısal hız
         # ----------------------------------------------------------------
         target_angular = 0.0
 
-        if aruco_active:
-            # ArUco marker var → marker'a yönel
-            target_angular       = aruco_angular
-            self.angular_integral = 0.0   # ArUco aktifken integral biriktirme
-        elif abs(heading_error) < self.heading_deadband:
+        if abs(heading_error) < self.heading_deadband:
             # [BUG FIX] Deadband içindeyken raw_angular tanımsız kalıyordu
             target_angular       = 0.0
             self.angular_integral = 0.0
@@ -620,19 +682,47 @@ class RoverNavigation(Node):
                              + self.SMOOTH_ALPHA * target_angular)
 
         # ----------------------------------------------------------------
+        # [GPS KAYMA] Tekerlek dönüyor ama araç ilerlemiyorsa geri manevra
+        # ----------------------------------------------------------------
+        if self._check_gps_slip(cur_x, cur_y, self.prev_linear):
+            self.get_logger().warn(
+                f"GPS KAYMA TESPİT EDİLDİ: {self.SLIP_CHECK_DURATION:.0f} sn'de "
+                f"GPS hareketi < {self.SLIP_MIN_DIST_M} m. Geri manevra başlatıldı.",
+                throttle_duration_sec=2.0
+            )
+            self.slip_recovery_end_time = time.time() + self.SLIP_RECOVERY_DURATION
+            self.stall_counter    = 0
+            self.angular_integral = 0.0
+            self.prev_linear      = 0.0   # smoother'ı sıfırla — ani geçiş önlenir
+            self.prev_angular     = 0.0
+
+        if self._in_slip_recovery() or self._in_stall_recovery():
+            self.send_to_hoverboard(-self.SLIP_REVERSE_SPEED, 0.0)
+            cmd = Twist()
+            cmd.linear.x  = -self.SLIP_REVERSE_SPEED
+            cmd.angular.z = 0.0
+            self.vel_pub.publish(cmd)
+            return
+
+        # ----------------------------------------------------------------
         # MOTOR & YAYINcı
         # ----------------------------------------------------------------
         self.send_to_hoverboard(self.prev_linear, self.prev_angular)
 
-        # [STALL] Komut verildi ama encoder hareketi yok → rover takıldı
+        # [STALL] Komut verildi ama encoder hareketi yok → rover fiziksel bloke
         if abs(self.prev_linear) > 0.1 and abs(vel_linear) < self.STALL_VEL_THR:
             self.stall_counter += 1
             if self.stall_counter >= self.STALL_MAX:
                 self.get_logger().warn(
                     f"ROVER TAKILDI! Encoder: {vel_linear:.3f} m/s | "
-                    f"Komut: {self.prev_linear:.2f} m/s",
+                    f"Komut: {self.prev_linear:.2f} m/s. Geri manevra başlatıldı.",
                     throttle_duration_sec=1.0
                 )
+                self.stall_recovery_end_time = time.time() + self.STALL_RECOVERY_DURATION
+                self.angular_integral = 0.0
+                self.prev_linear      = 0.0
+                self.prev_angular     = 0.0
+                self.stall_counter    = 0
         else:
             self.stall_counter = 0
 
@@ -647,7 +737,7 @@ class RoverNavigation(Node):
             f"dist={distance_error:.2f}m | "
             f"heading_err={math.degrees(heading_error):.1f}° | "
             f"v={self.prev_linear:.2f} w={self.prev_angular:.2f} | "
-            f"ArUco={'aktif' if aruco_active else 'yok'}",
+            f"ArUco={'görünüyor' if aruco_err is not None else 'yok'}",
             throttle_duration_sec=1.0
         )
 
